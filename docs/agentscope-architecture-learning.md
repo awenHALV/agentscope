@@ -164,8 +164,9 @@ mem0 的实现位于：
 
 1. 先跑通主链路：前端配置 `server_url` -> 能触发 chat -> SSE 收到事件。
 2. 再理解服务拼装：从 `examples/agent_service/main.py` 追到 `src/agentscope/app/`。
-3. 然后看中间件扩展：`_chat.py` 中 middlewares 如何注入与执行。
-4. 最后接 long term memory：先跑 `examples/long_term_memory/mem0/oss_demo.py`，再迁移到 `extra_agent_middlewares`。
+3. 理解 Agent 创建两条路径：UI `POST /agent/` vs 对话中 `TeamCreate` / `AgentCreate`（见 §21）。
+4. 然后看中间件扩展：`_chat.py` 中 middlewares 如何注入与执行。
+5. 最后接 long term memory：先跑 `examples/long_term_memory/mem0/oss_demo.py`，再迁移到 `extra_agent_middlewares`。
 
 ---
 
@@ -179,6 +180,9 @@ mem0 的实现位于：
 
 - 误区 3：`POST /chat/` 会直接返回完整回复  
   实际：它主要是触发执行，实时输出走 SSE。
+
+- 误区 4：对话会自动「生成」一个完整 Agent 配置  
+  实际：是 Leader LLM 调用 `AgentCreate` 工具，按模板 + 参数写入存储并唤醒 worker；见 §21。
 
 ---
 
@@ -476,8 +480,9 @@ app = create_app(
 3. `src/agentscope/app/_router/_chat.py` — chat 触发逻辑
 4. `src/agentscope/app/_router/_session.py` — SSE stream 实现
 5. `src/agentscope/app/_service/_chat.py` — Agent 组装与 middleware 注入
-6. `examples/web_ui/frontend/src/hooks/useMessages.ts` — 前端如何消费 SSE
-7. `examples/long_term_memory/mem0/README.md` — 长记忆扩展（可选）
+6. `src/agentscope/app/_tool/_agent_create.py` — 对话中创建子 Agent
+7. `examples/web_ui/frontend/src/hooks/useMessages.ts` — 前端如何消费 SSE
+8. `examples/long_term_memory/mem0/README.md` — 长记忆扩展（可选）
 
 ---
 
@@ -486,3 +491,221 @@ app = create_app(
 - [project-onboarding-and-structure.md](./project-onboarding-and-structure.md) — 本地启动实操记录与目录说明
 - [examples/long_term_memory/mem0/README.md](../examples/long_term_memory/mem0/README.md) — mem0 中间件详细文档
 - [官方文档](https://docs.agentscope.io/) — AgentScope 2.0 完整参考
+
+---
+
+## 21. Agent 是怎么「创建」并跑起来的
+
+这一节回答一个常见困惑：**Agent 是 UI 里配出来的，还是对话里「生成」出来的？**  
+答案是：两条路径并存，最终都汇入同一套 `ChatService` 动态组装执行链路。
+
+### 21.1 核心结论
+
+AgentScope **没有**单独的「用自然语言描述 → 自动填完整 Agent 配置表」的魔法接口。
+
+实际机制是：
+
+| 路径 | 谁决定 | 何时 | 存什么 |
+|------|--------|------|--------|
+| **UI / API 创建** | 用户填表单 | 聊天前 | `name`、`system_prompt`、`context_config`、`react_config` |
+| **对话中 AgentCreate** | Leader LLM 调工具 | 聊天过程中 | 模板 + LLM 填的 `name` / `description` / `prompt` |
+
+无论哪种方式，都只是把 **配置写入 Redis**；真正「跑起来」发生在每次 `POST /chat/` 时，`ChatService` 从存储读取记录并 **动态实例化** `Agent`（不是常驻进程）。
+
+### 21.2 路径一：UI / API 创建（对话前配置）
+
+用户在 Web UI 打开「创建 Agent」对话框，填写表单后调用 `POST /agent/`：
+
+- 前端：`examples/web_ui/frontend/src/components/dialog/AgentDialog.tsx`
+- 后端：`src/agentscope/app/_router/_agent.py`
+
+```python
+# 简化逻辑
+record = AgentRecord(
+    user_id=user_id,
+    data=AgentData(
+        name=body.name,
+        system_prompt=body.system_prompt,
+        context_config=body.context_config,
+        react_config=body.react_config,
+    ),
+)
+agent_id = await storage.upsert_agent(user_id, record)
+```
+
+此时只是 **持久化配置**。用户还需：
+
+1. 配置模型凭证（Credential）
+2. 创建 Session 并绑定模型
+3. 发消息触发 `POST /chat/`
+
+### 21.3 路径二：对话中动态创建子 Agent（多智能体）
+
+这是「**通过对话生成 Agent**」的真正含义：**Leader Agent 在 ReAct 循环里调用团队工具**，由 LLM 根据任务决定何时建队、招多少人、各自干什么。
+
+#### 时序总览
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Leader as Leader Agent
+    participant Tools as TeamCreate / AgentCreate
+    participant Storage as RedisStorage
+    participant Bus as MessageBus
+    participant Worker as Worker Agent
+
+    User->>Leader: 发消息（复杂任务）
+    Leader->>Tools: TeamCreate(name, description)
+    Tools->>Storage: 创建 TeamRecord，绑定 leader session
+    Leader->>Tools: AgentCreate(name, description, prompt)
+    Tools->>Storage: 创建 worker AgentRecord + SessionRecord
+    Tools->>Storage: 加入 team.member_ids
+    Tools->>Bus: inbox 推送首条任务 + enqueue_run_trigger
+    Bus->>Worker: WakeupDispatcher 唤醒 worker session
+    Worker->>Worker: 独立执行 prompt
+    Worker->>Leader: TeamSay 汇报结果
+```
+
+#### 团队工具如何挂到 Leader 上
+
+每次 chat run 组装 toolkit 时（`src/agentscope/app/_service/_toolkit.py`）：
+
+- `source="team"` 的 worker：只获得 `TeamSay`（向 Leader 汇报）
+- `source="user"` 的普通 Agent：获得完整 Leader 工具集
+  - `TeamCreate` — 建队
+  - `AgentCreate` — 创建子成员
+  - `TeamSay` — 协调沟通
+  - `TeamDelete` — 解散团队
+
+**不是框架替 LLM 决定建 Agent，而是 LLM 在推理中自己决定调用这些工具。**
+
+#### TeamCreate：先建队
+
+Leader 调用 `TeamCreate(name, description)`（`src/agentscope/app/_tool/_team_create.py`）：
+
+1. 创建 `TeamRecord`
+2. 把当前 session 标记为该 team 的 leader
+3. 返回 team id，提示后续用 `AgentCreate` 加成员
+
+约束：一个 session 同时只能领导一个 team。
+
+#### AgentCreate：真正「生成」子 Agent
+
+Leader 调用 `AgentCreate`，LLM 填写三个关键参数：
+
+| 参数 | 含义 |
+|------|------|
+| `name` | 成员标识，用于 `TeamSay(to=name)`，团队内唯一 |
+| `description` | 角色一句话，写入 system prompt |
+| `prompt` | 首条任务，**创建后 worker 立即开始执行** |
+
+工具内部（`src/agentscope/app/_tool/_agent_create.py`）依次：
+
+1. **创建 `AgentRecord`**（`source="team"`，不出现在 UI 全局 Agent 列表）
+2. 按 `SubAgentTemplate` 格式化 `system_prompt`（填入 team 名、成员名、leader 名等）
+3. **创建 `SessionRecord`**，继承 leader 的模型配置与合并后的权限上下文
+4. 将 worker 加入 `team.member_ids`
+5. 把 `prompt` 作为 `HintBlock` 推到 worker 的 inbox
+6. `enqueue_run_trigger` 唤醒 worker session 开始执行
+
+> 重要：`AgentCreate` 的 `prompt` 会立刻触发 worker 运行，**不需要** Leader 紧接着再 `TeamSay` 催一下。
+
+#### SubAgentTemplate：子 Agent 类型模板
+
+开发者在 `create_app(..., custom_subagent_templates=[...])` 注册模板（见 `examples/agent_service/main.py` 的 `explorer` 示例）。
+
+`SubAgentTemplate`（`src/agentscope/app/_types.py`）定义：
+
+- `type` — 路由键，如 `"explorer"`
+- `description` — 暴露给 LLM，帮助选型
+- `system_prompt_template` — 支持 `{team_name}`、`{member_name}`、`{leader_name}` 等占位符
+- `permission_context` — 如只读探索型权限
+- `override_leader_mode` / `extend_leader_permission_rules` — 是否继承 leader 权限
+
+注册多个模板后，`AgentCreate` 的 schema 会多出 `subagent_type` 枚举，Leader 可选类型创建不同专长的子 Agent。
+
+#### Worker 与 Leader 的通信
+
+- Worker 通过 `TeamSay` 向 Leader（或指定成员）汇报
+- Leader 通过 `TeamSay(to=name)` 向特定成员下达后续指令
+- 子 Agent 的 HITL 确认可通过 `SubagentHitlProjector` 投影到 Leader 的 UI
+
+#### 团队子 Agent 的生命周期
+
+| 属性 | 说明 |
+|------|------|
+| `source` | `"team"`，与 `"user"` 区分 |
+| UI 列表 | `list_agents` 会过滤掉 `source="team"` 的记录 |
+| 生命周期 | 随 team 存在；`TeamDelete` 时清理 |
+| 地址方式 | 通过 team 详情或直接 id 访问，不作为用户常规 Agent 枚举 |
+
+### 21.4 每次对话如何「跑」Agent（动态组装）
+
+无论 Agent 来自 UI 还是 `AgentCreate`，执行逻辑相同。`ChatService._run_body`（`src/agentscope/app/_service/_chat.py`）每次 run：
+
+1. 从 Redis 读取 `AgentRecord` + `SessionRecord`
+2. 解析 workspace，组装 toolkit（工作区工具 + 规划 + 调度 + 团队工具 + MCP/Skill）
+3. 挂载中间件（`InboxMiddleware`、`StateChangeMiddleware`、`ToolOffloadMiddleware` 等）
+4. 解析模型与凭证
+5. **实例化 `Agent(...)`** 并执行 `reply_stream`
+6. 事件经 MessageBus 推送到 SSE；消息与状态写回 Redis
+
+```python
+# 简化逻辑 — 每次 chat run 都会 new 一个 Agent 实例
+agent = self._agent_cls(
+    name=agent_record.data.name,
+    system_prompt=agent_record.data.system_prompt,
+    model=model,
+    toolkit=toolkit,
+    state=agent_state,      # 从 session 恢复
+    middlewares=middlewares,
+    ...
+)
+```
+
+因此：**Agent = 配置持久化 + 运行时动态组装**，不是长期驻留的独立进程。
+
+### 21.5 对话创建 Agent 的完整示例
+
+用户：「帮我调研 A 公司竞品，并写一份对比报告」
+
+Leader 可能的工具调用链：
+
+1. `TeamCreate(name="竞品调研", description="调研并产出对比报告")`
+2. `AgentCreate(name="researcher", description="负责搜集竞品信息", prompt="调研 A 公司前三竞品...")`
+3. `AgentCreate(name="analyst", description="负责写对比报告", prompt="根据 researcher 的汇报整理成对比表...")`
+4. 等待 worker 通过 `TeamSay` 汇报
+5. Leader 汇总后回复用户
+
+全程由 **LLM 决定** 是否建队、建几个成员、各自任务是什么；框架负责落库、权限继承、唤醒执行和事件推送。
+
+### 21.6 与前端 UI 的联动
+
+- `TeamCreate` / `AgentCreate` / `TeamDelete` 执行后，`StateChangeMiddleware` 会向 session 事件流推送 `CustomEvent(name="team_updated")`
+- 前端 SSE 收到后刷新团队视图（成员列表等）
+- 子 Agent 的执行事件走各自 session 的 `/stream`；需要用户确认时，可投影到 Leader 界面处理
+
+### 21.7 两条路径对比速查
+
+| | UI/API 创建 | 对话中 AgentCreate |
+|--|------------|-------------------|
+| **触发者** | 用户 | Leader LLM |
+| **system_prompt** | 用户手写 | 模板 + LLM 填的 description 格式化 |
+| **是否出现在 Agent 列表** | 是 | 否 |
+| **典型场景** | 固定助手、长期复用 | 复杂任务拆解、临时专班子 Agent |
+| **执行入口** | 同一 `POST /chat/` + `ChatService` | 同一链路；worker 还可被 `enqueue_run_trigger` 自动唤醒 |
+
+### 21.8 相关源码入口
+
+| 文件 | 作用 |
+|------|------|
+| `src/agentscope/app/_router/_agent.py` | UI/API 创建 Agent |
+| `src/agentscope/app/_tool/_team_create.py` | 对话中建队 |
+| `src/agentscope/app/_tool/_agent_create.py` | 对话中创建子 Agent |
+| `src/agentscope/app/_tool/_team_say.py` | 团队成员通信 |
+| `src/agentscope/app/_service/_toolkit.py` | 按 `source` 挂载团队工具 |
+| `src/agentscope/app/_service/_chat.py` | 动态组装并运行 Agent |
+| `src/agentscope/app/_types.py` | `SubAgentTemplate` 定义 |
+| `examples/agent_service/main.py` | 注册 `explorer` 等子 Agent 模板示例 |
+| `src/agentscope/app/middleware/_state_change_middleware.py` | `team_updated` 事件通知前端 |
+
