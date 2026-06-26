@@ -159,3 +159,9 @@ pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
+
+# ignore mcp skills
+examples/agent_service/workspaces/*/.mcp
+examples/agent_service/workspaces/*/skills/.skills
+
+.history
